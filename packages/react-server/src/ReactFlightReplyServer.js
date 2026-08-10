@@ -42,6 +42,7 @@ import {
   registerTemporaryReference,
 } from './ReactFlightServerTemporaryReferences';
 import {ASYNC_ITERATOR} from 'shared/ReactSymbols';
+import {enableFlightObjectReferences} from 'shared/ReactFeatureFlags';
 
 import hasOwnProperty from 'shared/hasOwnProperty';
 import getPrototypeOf from 'shared/getPrototypeOf';
@@ -220,6 +221,9 @@ export type Response = {
   _closed: boolean,
   _closedReason: mixed,
   _temporaryReferences: void | TemporaryReferenceSet,
+  _serverReferenceObjects: null | WeakSet<Object>,
+  _serverReferenceCache: WeakMap<Object, SomeChunk<any>>,
+  _serverObjectReferenceCache: WeakMap<Object, SomeChunk<any>>,
   _rootArrayContexts: WeakMap<$ReadOnlyArray<mixed>, NestedArrayContext>,
   _arraySizeLimit: number,
 };
@@ -441,8 +445,11 @@ function loadServerReference<A: Iterable<any>, T>(
 
   // Check for a cached promise from a previous call with the same metadata.
   // This handles deduplication when the same server reference appears multiple
-  // times in the payload.
-  const cachedPromise: SomeChunk<T> | void = (metaData as any).$$promise;
+  // times in the payload. The cache is a response-scoped map keyed by the
+  // metadata object rather than a field on it, so a client-supplied metadata
+  // field can't inject a resolved value and bypass the manifest lookup below.
+  const cachedPromise: SomeChunk<T> | void =
+    response._serverReferenceCache.get(metaData);
   if (cachedPromise !== undefined) {
     return readServerReference(
       response,
@@ -456,7 +463,7 @@ function loadServerReference<A: Iterable<any>, T>(
   // promise to be used for subsequent calls.
   // $FlowFixMe[invalid-constructor] Flow doesn't support functions as constructors
   const blockedPromise: BlockedChunk<T> = new ReactPromise(BLOCKED, null, null);
-  (metaData as any).$$promise = blockedPromise;
+  response._serverReferenceCache.set(metaData, blockedPromise);
 
   const serverReference: ServerReference<T> =
     resolveServerReference<$FlowFixMe>(response._bundlerConfig, id);
@@ -472,7 +479,7 @@ function loadServerReference<A: Iterable<any>, T>(
     } else {
       // Nothing to preload and no bound arguments to wait for, so we can
       // resolve the reference synchronously.
-      const value = requireModule(serverReference) as any;
+      const value = requireServerReference(response, serverReference) as any;
       resolveServerReferenceChunk(response, blockedPromise, value);
       return readServerReference(
         response,
@@ -488,7 +495,7 @@ function loadServerReference<A: Iterable<any>, T>(
   function fulfill(): void {
     let value;
     try {
-      value = requireModule(serverReference) as any;
+      value = requireServerReference(response, serverReference) as any;
       if (metaData.bound) {
         // This promise is coming from us and should have initialized by now.
         const promiseValue = (metaData.bound as any).value;
@@ -522,6 +529,27 @@ function loadServerReference<A: Iterable<any>, T>(
     parentObject,
     key,
   ) as any;
+}
+
+function requireServerReference<T>(
+  response: Response,
+  reference: ServerReference<T>,
+): T {
+  const value = requireModule(reference);
+  if (
+    typeof value === 'object' &&
+    // $FlowFixMe[invalid-compare] Module exports can be null at runtime.
+    value !== null
+  ) {
+    // A manifest export can be a fresh, untagged object. Remember its origin
+    // so reply property paths cannot read it as if it came from the client.
+    let serverReferenceObjects = response._serverReferenceObjects;
+    if (serverReferenceObjects === null) {
+      serverReferenceObjects = response._serverReferenceObjects = new WeakSet();
+    }
+    serverReferenceObjects.add(value);
+  }
+  return value;
 }
 
 function resolveServerReferenceChunk<T>(
@@ -561,6 +589,68 @@ function readServerReference<T>(
     default:
       throw chunk.reason;
   }
+}
+
+function loadServerObjectReference(
+  response: Response,
+  metaData: {id: any},
+  parentObject: Object,
+  key: string,
+): mixed {
+  const id: ServerReferenceId = metaData.id;
+  if (typeof id !== 'string') {
+    return null;
+  }
+
+  // Object references are cached in a separate response-scoped map from
+  // function references. The same metadata object can be referenced both ways,
+  // and each path must read only its own cache so it always applies its own
+  // validation instead of the other's cached value.
+  const cachedPromise: SomeChunk<Object> | void =
+    response._serverObjectReferenceCache.get(metaData);
+  if (cachedPromise !== undefined) {
+    return readServerReference(response, cachedPromise, parentObject, key);
+  }
+
+  // $FlowFixMe[invalid-constructor] Flow doesn't support functions as constructors
+  const blockedPromise: BlockedChunk<Object> = new ReactPromise(
+    BLOCKED,
+    null,
+    null,
+  );
+  response._serverObjectReferenceCache.set(metaData, blockedPromise);
+
+  const serverReference = resolveServerReference<$FlowFixMe>(
+    response._bundlerConfig,
+    id,
+  );
+  const serverReferencePromise = preloadModule(serverReference);
+
+  function fulfill(): void {
+    let value;
+    try {
+      value = requireServerReference(response, serverReference);
+      // Objects can appear under "then", but a function here would turn
+      // the containing object into a thenable during reply decoding.
+      if (typeof value !== 'object' || value === null) {
+        throw new Error(
+          'Expected a Server Reference to an object to resolve to an object.',
+        );
+      }
+    } catch (error) {
+      triggerErrorOnChunk(response, blockedPromise, error);
+      return;
+    }
+    resolveServerReferenceChunk(response, blockedPromise, value);
+  }
+  if (serverReferencePromise === null) {
+    fulfill();
+  } else {
+    serverReferencePromise.then(fulfill, error => {
+      triggerErrorOnChunk(response, blockedPromise, error);
+    });
+  }
+  return readServerReference(response, blockedPromise, parentObject, key);
 }
 
 function reviveModel(
@@ -846,12 +936,15 @@ function fulfillReference(
   try {
     let localLength: number = 0;
     const rootArrayContexts = response._rootArrayContexts;
+    const serverReferenceObjects = response._serverReferenceObjects;
     for (let i = 1; i < path.length; i++) {
       // The server doesn't have any lazy references so we don't expect to go through a Promise.
       const name = path[i];
       if (
         typeof value === 'object' &&
         value !== null &&
+        (serverReferenceObjects === null ||
+          !serverReferenceObjects.has(value)) &&
         (getPrototypeOf(value) === ObjectPrototype ||
           getPrototypeOf(value) === ArrayPrototype) &&
         hasOwnProperty.call(value, name)
@@ -1054,12 +1147,15 @@ function getOutlinedModel<T>(
 
       let localLength: number = 0;
       const rootArrayContexts = response._rootArrayContexts;
+      const serverReferenceObjects = response._serverReferenceObjects;
       for (let i = 1; i < path.length; i++) {
         const name = path[i];
         if (
           typeof value === 'object' &&
           // $FlowFixMe[invalid-compare] This check is still needed at runtime.
           value !== null &&
+          (serverReferenceObjects === null ||
+            !serverReferenceObjects.has(value)) &&
           (getPrototypeOf(value) === ObjectPrototype ||
             getPrototypeOf(value) === ArrayPrototype) &&
           hasOwnProperty.call(value, name)
@@ -1148,11 +1244,27 @@ function getOutlinedModel<T>(
   }
 }
 
+function isServerReferenceObject(response: Response, value: mixed): boolean {
+  // A Server Reference to an object is opaque: the client may only pass it
+  // back to the server, never have its contents read out. The consuming
+  // decoders below (Map, Set, iterator) read their initializer array directly,
+  // without traversing a property path, so the opacity guard in the path
+  // walkers doesn't cover them. They reject a server-owned array up front,
+  // before consuming or mutating it, by checking this alongside `isArray`.
+  const serverReferenceObjects = response._serverReferenceObjects;
+  return (
+    serverReferenceObjects !== null &&
+    typeof value === 'object' &&
+    value !== null &&
+    serverReferenceObjects.has(value)
+  );
+}
+
 function createMap(
   response: Response,
   model: Array<[any, any]>,
 ): Map<any, any> {
-  if (!isArray(model)) {
+  if (!isArray(model) || isServerReferenceObject(response, model)) {
     throw new Error('Invalid Map initializer.');
   }
   if ((model as any).$$consumed === true) {
@@ -1165,7 +1277,7 @@ function createMap(
 }
 
 function createSet(response: Response, model: Array<any>): Set<any> {
-  if (!isArray(model)) {
+  if (!isArray(model) || isServerReferenceObject(response, model)) {
     throw new Error('Invalid Set initializer.');
   }
   if ((model as any).$$consumed === true) {
@@ -1178,7 +1290,7 @@ function createSet(response: Response, model: Array<any>): Set<any> {
 }
 
 function extractIterator(response: Response, model: Array<any>): Iterator<any> {
-  if (!isArray(model)) {
+  if (!isArray(model) || isServerReferenceObject(response, model)) {
     throw new Error('Invalid Iterator initializer.');
   }
   if ((model as any).$$consumed === true) {
@@ -1604,6 +1716,24 @@ function parseModelString(
           loadServerReference,
         );
       }
+      case 'H': {
+        if (enableFlightObjectReferences) {
+          // Server Reference to an object. Its metadata carries only an id —
+          // no bound arguments — and it resolves through the same manifest
+          // lookup as a function reference, which returns the module export
+          // without calling it.
+          const ref = value.slice(2);
+          return getOutlinedModel(
+            response,
+            ref,
+            obj,
+            key,
+            null,
+            loadServerObjectReference,
+          );
+        }
+        return undefined;
+      }
       case 'T': {
         // Temporary Reference
         if (
@@ -1916,6 +2046,9 @@ export function createResponse(
     _closed: false,
     _closedReason: null,
     _temporaryReferences: temporaryReferences,
+    _serverReferenceObjects: null,
+    _serverReferenceCache: new WeakMap(),
+    _serverObjectReferenceCache: new WeakMap(),
     _rootArrayContexts: new WeakMap(),
     _arraySizeLimit: arraySizeLimit,
   };
