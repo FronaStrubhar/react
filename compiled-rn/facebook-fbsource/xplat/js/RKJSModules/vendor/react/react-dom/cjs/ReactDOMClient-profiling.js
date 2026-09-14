@@ -7,7 +7,7 @@
  * @noflow
  * @nolint
  * @preventMunge
- * @generated SignedSource<<b924c69181c06d6a77ca7bea8f8ff901>>
+ * @generated SignedSource<<8d3aa5945309c8fdd2d4bf11ffe521e0>>
  */
 
 /*
@@ -16971,7 +16971,10 @@ function dispatchEventForPluginEventSystem(
           nativeEvent.type,
           inCapturePhase,
           !inCapturePhase &&
-            ("scroll" === domEventName || "scrollend" === domEventName)
+            ("scroll" === domEventName ||
+              "scrollend" === domEventName ||
+              "toggle" === domEventName ||
+              "beforetoggle" === domEventName)
         );
         0 < inCapturePhase.length &&
           ((reactName = new SyntheticEventCtor(
@@ -21637,14 +21640,14 @@ ReactDOMHydrationRoot.prototype.unstable_scheduleHydration = function (target) {
 };
 var isomorphicReactPackageVersion$jscomp$inline_2475 = React.version;
 if (
-  "19.3.0-native-fb-564923c8-20260913" !==
+  "19.3.0-native-fb-b6da5227-20260914" !==
   isomorphicReactPackageVersion$jscomp$inline_2475
 )
   throw Error(
     formatProdErrorMessage(
       527,
       isomorphicReactPackageVersion$jscomp$inline_2475,
-      "19.3.0-native-fb-564923c8-20260913"
+      "19.3.0-native-fb-b6da5227-20260914"
     )
   );
 ReactDOMSharedInternals.findDOMNode = function (componentOrElement) {
@@ -21666,10 +21669,10 @@ ReactDOMSharedInternals.findDOMNode = function (componentOrElement) {
 };
 var internals$jscomp$inline_2482 = {
   bundleType: 0,
-  version: "19.3.0-native-fb-564923c8-20260913",
+  version: "19.3.0-native-fb-b6da5227-20260914",
   rendererPackageName: "react-dom",
   currentDispatcherRef: ReactSharedInternals,
-  reconcilerVersion: "19.3.0-native-fb-564923c8-20260913",
+  reconcilerVersion: "19.3.0-native-fb-b6da5227-20260914",
   getLaneLabelMap: function () {
     for (
       var map = new Map(), lane = 1, index$351 = 0;
@@ -21792,4 +21795,4 @@ exports.hydrateRoot = function (container, initialChildren, options) {
   listenToAllSupportedEvents(container);
   return new ReactDOMHydrationRoot(initialChildren);
 };
-exports.version = "19.3.0-native-fb-564923c8-20260913";
+exports.version = "19.3.0-native-fb-b6da5227-20260914";
