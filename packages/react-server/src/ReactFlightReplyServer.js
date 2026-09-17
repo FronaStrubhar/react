@@ -444,38 +444,12 @@ function loadServerReference<A: Iterable<any>, T>(
   // times in the payload.
   const cachedPromise: SomeChunk<T> | void = (metaData as any).$$promise;
   if (cachedPromise !== undefined) {
-    if (cachedPromise.status === INITIALIZED) {
-      // The value was already resolved by a previous call.
-      const resolvedValue: T = cachedPromise.value;
-      if (key === __PROTO__) {
-        return null as any;
-      }
-      parentObject[key] = resolvedValue;
-      return resolvedValue as any;
-    }
-
-    // The promise is still blocked. Increment the handler dependency count ...
-    let handler: InitializationHandler;
-    if (initializingHandler) {
-      handler = initializingHandler;
-      handler.deps++;
-    } else {
-      handler = initializingHandler = {
-        chunk: null,
-        value: null,
-        reason: null,
-        deps: 1,
-        errored: false,
-      };
-    }
-    // ... and register resolve and reject listeners on the promise.
-    cachedPromise.then(
-      resolveReference.bind(null, response, handler, parentObject, key),
-      rejectReference.bind(null, response, handler),
-    );
-
-    // Return a place holder value for now.
-    return null as any;
+    return readServerReference(
+      response,
+      cachedPromise,
+      parentObject,
+      key,
+    ) as any;
   }
 
   // This is the first call for this server reference metadata. Create a cached
@@ -496,92 +470,97 @@ function loadServerReference<A: Iterable<any>, T>(
     if (bound instanceof ReactPromise) {
       serverReferencePromise = Promise.resolve(bound);
     } else {
-      const resolvedValue = requireModule(serverReference) as any;
-      // Resolve the cached promise synchronously.
-      const initializedPromise: InitializedChunk<T> = blockedPromise as any;
-      initializedPromise.status = INITIALIZED;
-      initializedPromise.value = resolvedValue;
-      initializedPromise.reason = null;
-      return resolvedValue;
+      // Nothing to preload and no bound arguments to wait for, so we can
+      // resolve the reference synchronously.
+      const value = requireModule(serverReference) as any;
+      resolveServerReferenceChunk(response, blockedPromise, value);
+      return readServerReference(
+        response,
+        blockedPromise,
+        parentObject,
+        key,
+      ) as any;
     }
   } else if (bound instanceof ReactPromise) {
     serverReferencePromise = Promise.all([serverReferencePromise, bound]);
   }
 
-  let handler: InitializationHandler;
-  if (initializingHandler) {
-    handler = initializingHandler;
-    handler.deps++;
-  } else {
-    handler = initializingHandler = {
-      chunk: null,
-      value: null,
-      reason: null,
-      deps: 1,
-      errored: false,
-    };
-  }
-
   function fulfill(): void {
-    let resolvedValue = requireModule(serverReference) as any;
-
-    if (metaData.bound) {
-      // This promise is coming from us and should have initialized by now.
-      const promiseValue = (metaData.bound as any).value;
-      const boundArgs: Array<any> = isArray(promiseValue)
-        ? promiseValue.slice(0)
-        : [];
-      if (boundArgs.length > MAX_BOUND_ARGS) {
-        reject(
-          new Error(
+    let value;
+    try {
+      value = requireModule(serverReference) as any;
+      if (metaData.bound) {
+        // This promise is coming from us and should have initialized by now.
+        const promiseValue = (metaData.bound as any).value;
+        const boundArgs: Array<any> = isArray(promiseValue)
+          ? promiseValue.slice(0)
+          : [];
+        if (boundArgs.length > MAX_BOUND_ARGS) {
+          throw new Error(
             'Server Function has too many bound arguments. Received ' +
               boundArgs.length +
               ' but the limit is ' +
               MAX_BOUND_ARGS +
               '.',
-          ),
-        );
-        return;
+          );
+        }
+        boundArgs.unshift(null); // this
+        value = value.bind.apply(value, boundArgs);
       }
-      boundArgs.unshift(null); // this
-      resolvedValue = resolvedValue.bind.apply(resolvedValue, boundArgs);
+    } catch (error) {
+      triggerErrorOnChunk(response, blockedPromise, error);
+      return;
     }
-
-    // Resolve the cached promise so subsequent references can use the value.
-    const resolveListeners = blockedPromise.value;
-    const initializedPromise: InitializedChunk<T> = blockedPromise as any;
-    initializedPromise.status = INITIALIZED;
-    initializedPromise.value = resolvedValue;
-    initializedPromise.reason = null;
-    if (resolveListeners !== null) {
-      // Notify any resolve listeners that were added via .then() from
-      // subsequent loadServerReference calls for the same reference.
-      wakeChunk(response, resolveListeners, resolvedValue, initializedPromise);
-    }
-
-    resolveReference(response, handler, parentObject, key, resolvedValue);
+    resolveServerReferenceChunk(response, blockedPromise, value);
   }
+  serverReferencePromise.then(fulfill, error => {
+    triggerErrorOnChunk(response, blockedPromise, error);
+  });
+  return readServerReference(
+    response,
+    blockedPromise,
+    parentObject,
+    key,
+  ) as any;
+}
 
-  function reject(error: mixed): void {
-    // Mark the cached promise as errored so subsequent references fail too.
-    const rejectListeners = blockedPromise.reason;
-    const erroredPromise: ErroredChunk<T> = blockedPromise as any;
-    erroredPromise.status = ERRORED;
-    erroredPromise.value = null;
-    erroredPromise.reason = error;
-    if (rejectListeners !== null) {
-      // Notify any reject listeners that were added via .then() from subsequent
-      // loadServerReference calls for the same reference.
-      rejectChunk(response, rejectListeners, error);
-    }
-
-    rejectReference(response, handler, error);
+function resolveServerReferenceChunk<T>(
+  response: Response,
+  chunk: BlockedChunk<T>,
+  value: T,
+): void {
+  const resolveListeners = chunk.value;
+  const initializedChunk: InitializedChunk<T> = chunk as any;
+  initializedChunk.status = INITIALIZED;
+  initializedChunk.value = value;
+  initializedChunk.reason = null;
+  if (resolveListeners !== null) {
+    wakeChunk(response, resolveListeners, value, initializedChunk);
   }
+}
 
-  serverReferencePromise.then(fulfill, reject);
-
-  // Return a place holder value for now.
-  return null as any;
+function readServerReference<T>(
+  response: Response,
+  chunk: SomeChunk<T>,
+  parentObject: Object,
+  key: string,
+): T {
+  switch (chunk.status) {
+    case INITIALIZED:
+      return chunk.value;
+    case BLOCKED:
+      return waitForReference(
+        response,
+        chunk,
+        parentObject,
+        key,
+        null,
+        createModel,
+        [],
+      );
+    default:
+      throw chunk.reason;
+  }
 }
 
 function reviveModel(
